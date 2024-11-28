@@ -1,167 +1,199 @@
-import hydra
-
+import os
+import multiprocessing
+import random
 import numpy as np
+from typing import Optional
+from itertools import accumulate
+
 import torch
-import torch.cuda
-import tqdm
 from tensordict import TensorDict
 
-from torchrl.envs import (
-    DoubleToFloat,
-    TransformedEnv,
-)
+from torchrl.data import CompositeSpec, UnboundedContinuousTensorSpec, BoundedTensorSpec
+from torchrl.envs import EnvBase, TransformedEnv, DoubleToFloat
+from torchrl.envs.utils import check_env_specs
 
-from torchrl.record.loggers import generate_exp_name, get_logger
-from utils import (
-    log_metrics,
-    make_collector,
-    make_loss_module,
-    make_replay_buffer,
-    make_sac_agent,
-    make_sac_optimizer,
-)
+from vllm_expert import vLLM_Expert
+from datasets import load_from_disk
 
-@hydra.main(version_base="1.1", config_path="", config_name="config")
-def main(cfg):
-    device = "cpu"
+def _set_seed(self, seed: Optional[int]):
+    random.seed(seed)
+    np.random.seed(seed)
+    rng = torch.manual_seed(seed)
+    self.rng = rng
 
-    torch.manual_seed(cfg.env.seed)
-    np.random.seed(cfg.env.seed)
+def _step(self, tensordict):
+    # model selection
+    weights = tensordict["action"].squeeze(-1)
+    expert_idx = torch.argmax(weights, dim=-1).unsqueeze(dim=0)
+    
+    # do action
+    penalty = 0 
+    if expert_idx < self.num_experts:
+        self.experts[expert_idx].add(self.times_idx)
 
-    from env import MyEnv
-    env = MyEnv(num_experts=cfg.env.num_experts, lam=cfg.env.lam, L=cfg.env.L, seed=cfg.env.seed)
+        # penalty
+        data = self.dataset[self.times_idx]
+        prompt = data["instruction"] + " " + data["input"]
+        input_tokens = len(self.experts[expert_idx].expert.get_tokenizer()(prompt)["input_ids"])
+        outputs = data["candidates"][self.experts[expert_idx].id]["text"]
+        output_tokens = len(self.experts[expert_idx].expert.get_tokenizer()(outputs)["input_ids"])
+        penalty = self.experts[expert_idx].penalty(input_tokens, output_tokens)
+
+    # reward
+    reward = sum([expert.get_and_reset_reward() for expert in self.experts]) - penalty
+
+    # step time
+    self.times_idx += 1
+    self.current_time = self.workload[self.times_idx]
+    for expert in self.experts:
+        while expert.current_time < self.current_time if self.times_idx < 5000 \
+            else expert.llm_engine.has_unfinished_requests():
+            expert.step()
+
+    # done
+    done = True if self.times_idx == 5000 else False
+
+    # new observation
+    data = self.dataset[self.times_idx % 5000]
+    prompt = data["instruction"] + " " + data["input"]
+    input_tokens = [len(self.experts[i].expert.get_tokenizer()(prompt)["input_ids"]) for i in range(self.num_experts)]
+    pred_output_tokens = [data["pred_output_tokens"][self.experts[i].id] for i in range(self.num_experts)]
+    pred_scores = [data["pred_score"][self.experts[i].id] for i in range(self.num_experts)]
+
+    new_observation = []
+    new_observation.extend(input_tokens)
+    new_observation.extend(pred_scores)
+    new_observation.extend(pred_output_tokens)
+    for i in range(self.num_experts):
+        new_observation.extend(self.experts[i].get_features())
+
+    # res
+    out = TensorDict(
+        {
+            "observation": new_observation,
+            "reward": reward,
+            "done": done,
+        },
+        tensordict.shape,
+        device=self.device,
+    )
+    return out
+
+def _reset(self, tensordict):
+    # reset env
+    self.times_idx = 0
+    self.current_time = self.workload[self.times_idx]
+    for expert in self.experts:
+        expert.reset()
+
+    # observation
+    data = self.dataset[self.times_idx]
+    prompt = data["instruction"] + " " + data["input"]
+    input_tokens = [len(self.experts[i].expert.get_tokenizer()(prompt)["input_ids"]) for i in range(self.num_experts)]
+    pred_output_tokens = [data["pred_output_tokens"][self.experts[i].id] for i in range(self.num_experts)]
+    pred_scores = [data["pred_score"][self.experts[i].id] for i in range(self.num_experts)]
+    new_observation = []
+    new_observation.extend(input_tokens)
+    new_observation.extend(pred_scores)
+    new_observation.extend(pred_output_tokens)
+    for i in range(self.num_experts):
+        new_observation.extend(self.experts[i].get_features())
+
+    out = TensorDict(
+        {
+            "observation": new_observation,
+        },
+        batch_size=[],
+        device=self.device,
+    )
+    return out
+
+def _make_spec(self):
+    self.observation_spec = CompositeSpec(
+        observation=UnboundedContinuousTensorSpec(shape=(126 * self.num_experts,), dtype=torch.float64, device=self.device),
+        device=self.device,
+    )
+
+    # since the environment is stateless, we expect the previous output as input.
+    # For this, ``EnvBase`` expects some state_spec to be available
+    self.state_spec = self.observation_spec.clone()
+    # action-spec will be automatically wrapped in input_spec when
+    # `self.action_spec = spec` will be called supported
+    self.action_spec = BoundedTensorSpec(
+        low=-1,
+        high=1,
+        shape=(self.num_experts + 1,),
+        dtype=torch.float32,
+        device=self.device
+    )
+    
+    self.reward_spec = CompositeSpec(
+        reward=UnboundedContinuousTensorSpec(shape=(1,), device=self.device, dtype=torch.float64),
+        device=self.device,
+    )
+
+def init_vllm_expert(param, device):
+    # 设置环境变量
+    os.environ["CUDA_VISIBLE_DEVICES"] = device
+    
+    # 初始化vLLM_Expert对象
+    expert = vLLM_Expert(*param)
+    return expert
+
+class MyEnv(EnvBase):
+    metadata = {
+        "render_modes": ["human", "rgb_array"],
+        "render_fps": 30,
+    }
+    batch_locked = False
+
+    def __init__(self, num_experts=3, lam=3.0, L=0.03, seed=None, device="cpu"):
+        super().__init__(device=device, batch_size=[])
+        self.num_experts = num_experts
+        self.lam = lam
+        self.L = L
+
+        self.dataset = load_from_disk("/root/nfs/drl_scheduling/simulator2/datasets/llm-blender/mix-instruct/train")
+
+        self.expert_params = [
+            ((2, "/root/nfs/models/chavinlo/alpaca-native", 7.2 * 1e-5, 2.5 * 1e-5, self.L), "0"),
+            ((9, "/root/nfs/models/THUDM/chatglm-6b", 6.8 * 1e-5, 2.5 * 1e-5, self.L), "1"),
+            ((11, "/root/nfs/models/mosaicml/mpt-7b-instruct", 7.2 * 1e-5, 2.5 * 1e-5, self.L), "2"),
+            ((1, "/root/nfs/models/TheBloke/koala-7B-HF", 7.2 * 1e-5, 2.5 * 1e-5, self.L), "3"),
+            ((3, "/root/nfs/models/mosesjun0h/llama-7b-hf-baize-lora-bf16", 7.2 * 1e-5, 2.5 * 1e-5, self.L), "4"),
+            ((10, "/root/nfs/models/mosaicml/mpt-7b", 7.2 * 1e-5, 2.5 * 1e-5, self.L), "5"),
+        ]
+
+        self.experts = [init_vllm_expert(param[0], param[1]) for param in self.expert_params[:self.num_experts]]
+
+        # init spec
+        self._make_spec()
+
+        # set seed
+        if seed is None:
+            seed = torch.empty((), dtype=torch.int64).random_().item()
+        self._set_seed(seed)
+
+        # workload
+        workload = np.random.exponential(1 / self.lam, 4999)
+        workload = [0] + list(accumulate(workload)) + [np.inf]
+        self.workload = [round(x, 2) for x in workload]
+        self.times_idx = 0
+
+        self.cumulated_reward = 0.0
+
+    # Helpers: _make_spec, _process, _filter
+    _make_spec = _make_spec
+
+    # Mandatory methods: _step, _reset and _set_seed
+    _reset = _reset
+    _step = _step
+    _set_seed = _set_seed
+
+if __name__ == "__main__":
+    env = MyEnv(seed=2024)
     env = TransformedEnv(
         env,
         DoubleToFloat(),
     )
-
-    # Create logger
-    exp_name = generate_exp_name("SAC", cfg.logger.exp_name)
-    logger = None
-    if cfg.logger.backend:
-        logger = get_logger(
-            logger_type=cfg.logger.backend,
-            logger_name="sac_logging",
-            experiment_name=exp_name,
-            wandb_kwargs={
-                "mode": cfg.logger.mode,
-                "config": dict(cfg),
-                "project": cfg.logger.project_name,
-                "group": cfg.logger.group_name,
-            },
-        )
-
-    # Create agent
-    model, exploration_policy = make_sac_agent(cfg, env, device)
-    
-    # Create SAC loss
-    loss_module, target_net_updater = make_loss_module(cfg, model)
-
-    # Create off-policy collector
-    collector = make_collector(cfg, env, exploration_policy)
-
-    # Create replay buffer
-    replay_buffer = make_replay_buffer(
-        batch_size=cfg.optim.batch_size,
-        prb=cfg.replay_buffer.prb,
-        buffer_size=cfg.replay_buffer.size,
-        scratch_dir=cfg.replay_buffer.scratch_dir,
-        device="cpu",
-    )
-
-    # Create optimizers
-    (
-        optimizer_actor,
-        optimizer_critic,
-        optimizer_alpha,
-    ) = make_sac_optimizer(cfg, loss_module)
-
-    # Main loop
-    collected_frames = 0
-    pbar = tqdm.tqdm(total=cfg.collector.total_frames)
-
-    init_random_frames = cfg.collector.init_random_frames
-    num_updates = int(
-        cfg.collector.env_per_collector
-        * cfg.collector.frames_per_batch
-        * cfg.optim.utd_ratio
-    )
-    prb = cfg.replay_buffer.prb
-
-    for epoch, tensordict in enumerate(collector):
-
-        # Update weights of the inference policy
-        collector.update_policy_weights_()
-
-        tensordict = tensordict.reshape(-1)
-        current_frames = tensordict.numel()
-        # Add to replay buffer
-        replay_buffer.extend(tensordict.cpu())
-        collected_frames += current_frames
-
-        # Optimization steps
-        if collected_frames >= init_random_frames:
-            losses = TensorDict({}, batch_size=[num_updates])
-            for i in range(num_updates):
-                # Sample from replay buffer
-                sampled_tensordict = replay_buffer.sample()
-                if sampled_tensordict.device != device:
-                    sampled_tensordict = sampled_tensordict.to(
-                        device, non_blocking=True
-                    )
-                else:
-                    sampled_tensordict = sampled_tensordict.clone()
-
-                # Compute loss
-                loss_td = loss_module(sampled_tensordict)
-
-                actor_loss = loss_td["loss_actor"]
-                q_loss = loss_td["loss_qvalue"]
-                alpha_loss = loss_td["loss_alpha"]
-
-                # Update actor
-                optimizer_actor.zero_grad()
-                actor_loss.backward()
-                optimizer_actor.step()
-
-                # Update critic
-                optimizer_critic.zero_grad()
-                q_loss.backward()
-                optimizer_critic.step()
-
-                # Update alpha
-                optimizer_alpha.zero_grad()
-                alpha_loss.backward()
-                optimizer_alpha.step()
-
-                losses[i] = loss_td.select(
-                    "loss_actor", "loss_qvalue", "loss_alpha"
-                ).detach()
-
-                # Update qnet_target params
-                target_net_updater.step()
-
-                # Update priority
-                if prb:
-                    replay_buffer.update_priority(sampled_tensordict)
-
-        episode_rewards = tensordict["next", "reward"]
-
-        # Logging
-        metrics_to_log = {}
-        if len(episode_rewards) > 0:
-            metrics_to_log["train/reward"] = episode_rewards.sum().item() / 5000
-
-        # Evaluation pass
-
-        # Logging
-        if logger is not None:
-            log_metrics(logger, metrics_to_log, epoch+1)
-
-        pbar.update(tensordict.numel())
-
-    collector.shutdown()
-    
-
-if __name__ == "__main__":
-    main()
+    check_env_specs(env)
