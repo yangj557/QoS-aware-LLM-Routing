@@ -1,7 +1,12 @@
+import os
 import random
 import numpy as np
 from typing import Optional
 from itertools import accumulate
+
+import ray
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 import torch
 from tensordict import TensorDict
@@ -27,26 +32,27 @@ def _step(self, tensordict):
     # do action
     penalty = 0 
     if expert_idx < self.num_experts:
-        self.experts[expert_idx].add(self.times_idx)
+        future = self.experts[expert_idx].add.remote(self.times_idx)
+        ray.get(future)
 
         # penalty
         data = self.dataset[self.times_idx]
         prompt = data["instruction"] + " " + data["input"]
-        input_tokens = len(self.experts[expert_idx].expert.get_tokenizer()(prompt)["input_ids"])
-        outputs = data["candidates"][self.experts[expert_idx].id]["text"]
-        output_tokens = len(self.experts[expert_idx].expert.get_tokenizer()(outputs)["input_ids"])
-        penalty = self.experts[expert_idx].penalty(input_tokens, output_tokens)
+        input_tokens = self.experts[expert_idx].get_length.remote(prompt)
+        outputs = data["candidates"][self.expert_params[expert_idx][0]]["text"]
+        output_tokens = self.experts[expert_idx].get_length.remote(outputs)
+        penalty = self.experts[expert_idx].penalty.remote(input_tokens, output_tokens)
+        penalty = ray.get(penalty)
 
     # reward
-    reward = sum([expert.get_and_reset_reward() for expert in self.experts]) - penalty
+    futrues = [expert.get_and_reset_reward.remote() for expert in self.experts]
+    reward = sum(ray.get(futrues)) - penalty
 
     # step time
     self.times_idx += 1
     self.current_time = self.workload[self.times_idx]
-    for expert in self.experts:
-        while expert.current_time < self.current_time if self.times_idx < 5000 \
-            else expert.llm_engine.has_unfinished_requests():
-            expert.step()
+    futures = [expert.step_to_time.remote(self.current_time, self.times_idx >= 5000) for expert in self.experts]
+    ray.get(futures)
 
     # done
     done = True if self.times_idx == 5000 else False
@@ -54,16 +60,19 @@ def _step(self, tensordict):
     # new observation
     data = self.dataset[self.times_idx % 5000]
     prompt = data["instruction"] + " " + data["input"]
-    input_tokens = [len(self.experts[i].expert.get_tokenizer()(prompt)["input_ids"]) for i in range(self.num_experts)]
-    pred_output_tokens = [data["pred_output_tokens"][self.experts[i].id] for i in range(self.num_experts)]
-    pred_scores = [data["pred_score"][self.experts[i].id] for i in range(self.num_experts)]
+    input_tokens = [expert.get_length.remote(prompt) for expert in self.experts]
+    input_tokens = ray.get(input_tokens)
+    pred_output_tokens = [data["pred_output_tokens"][self.expert_params[i][0]] for i in range(self.num_experts)]
+    pred_scores = [data["pred_score"][self.expert_params[i][0]] for i in range(self.num_experts)]
 
     new_observation = []
     new_observation.extend(input_tokens)
     new_observation.extend(pred_scores)
     new_observation.extend(pred_output_tokens)
-    for i in range(self.num_experts):
-        new_observation.extend(self.experts[i].get_features())
+    futrues = [expert.get_features.remote() for expert in self.experts]
+    features = ray.get(futrues)
+    for feature in features:
+        new_observation.extend(feature)
 
     # res
     out = TensorDict(
@@ -81,21 +90,24 @@ def _reset(self, tensordict):
     # reset env
     self.times_idx = 0
     self.current_time = self.workload[self.times_idx]
-    for expert in self.experts:
-        expert.reset()
+    futrues = [expert.reset.remote() for expert in self.experts]
+    ray.get(futrues)
 
     # observation
     data = self.dataset[self.times_idx]
     prompt = data["instruction"] + " " + data["input"]
-    input_tokens = [len(self.experts[i].expert.get_tokenizer()(prompt)["input_ids"]) for i in range(self.num_experts)]
-    pred_output_tokens = [data["pred_output_tokens"][self.experts[i].id] for i in range(self.num_experts)]
-    pred_scores = [data["pred_score"][self.experts[i].id] for i in range(self.num_experts)]
+    input_tokens = [expert.get_length.remote(prompt) for expert in self.experts]
+    input_tokens = ray.get(input_tokens)
+    pred_output_tokens = [data["pred_output_tokens"][self.expert_params[i][0]] for i in range(self.num_experts)]
+    pred_scores = [data["pred_score"][self.expert_params[i][0]] for i in range(self.num_experts)]
     new_observation = []
     new_observation.extend(input_tokens)
     new_observation.extend(pred_scores)
     new_observation.extend(pred_output_tokens)
-    for i in range(self.num_experts):
-        new_observation.extend(self.experts[i].get_features())
+    futrues = [expert.get_features.remote() for expert in self.experts]
+    features = ray.get(futrues)
+    for feature in features:
+        new_observation.extend(feature)
 
     out = TensorDict(
         {
@@ -143,19 +155,33 @@ class MyEnv(EnvBase):
         self.lam = lam
         self.L = L
 
+        self.dataset = load_from_disk("/root/nfs/drl_scheduling/simulator2/datasets/llm-blender/mix-instruct/train")
+
+        ray.init()
+        pg = placement_group(
+            name="llm_pg",
+            bundles=[{"GPU": 1, "CPU": 1} for _ in range(num_experts)],
+            strategy="STRICT_PACK"  # or "PACK" or "SPREAD" depending on your needs
+        )
+        ray.get(pg.ready())
+
         self.expert_params = [
-            (2, "/root/nfs/models/chavinlo/alpaca-native", 7.2 * 1e-5, 2.5 * 1e-5),
-            (9, "/root/nfs/models/THUDM/chatglm-6b", 6.8 * 1e-5, 2.5 * 1e-5),
-            (11, "/root/nfs/models/mosaicml/mpt-7b-instruct", 7.2 * 1e-5, 2.5 * 1e-5),
-            (1, "/root/nfs/models/TheBloke/koala-7B-HF", 7.2 * 1e-5, 2.5 * 1e-5),
-            (3, "/root/nfs/models/mosesjun0h/llama-7b-hf-baize-lora-bf16", 7.2 * 1e-5, 2.5 * 1e-5),
-            (10, "/root/nfs/models/mosaicml/mpt-7b", 7.2 * 1e-5, 2.5 * 1e-5),
+            (2, "/root/nfs/models/chavinlo/alpaca-native", 7.2 * 1e-5, 2.5 * 1e-5, self.L),
+            (9, "/root/nfs/models/THUDM/chatglm-6b", 6.8 * 1e-5, 2.5 * 1e-5, self.L),
+            (11, "/root/nfs/models/mosaicml/mpt-7b-instruct", 7.2 * 1e-5, 2.5 * 1e-5, self.L),
+            (1, "/root/nfs/models/TheBloke/koala-7B-HF", 7.2 * 1e-5, 2.5 * 1e-5, self.L),
+            (3, "/root/nfs/models/mosesjun0h/llama-7b-hf-baize-lora-bf16", 7.2 * 1e-5, 2.5 * 1e-5, self.L),
+            (10, "/root/nfs/models/mosaicml/mpt-7b", 7.2 * 1e-5, 2.5 * 1e-5, self.L),
         ]
 
         self.experts = [
-            vLLM_Expert(*param, L=self.L) for param in self.expert_params[:self.num_experts]
+            vLLM_Expert.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i
+                )
+            ).remote(*self.expert_params[i]) for i in range(self.num_experts)
         ]
-        self.dataset = load_from_disk("/root/nfs/drl_scheduling/simulator2/datasets/llm-blender/mix-instruct/train")
 
         # init spec
         self._make_spec()
