@@ -1,9 +1,11 @@
-
+import os
+import ray
 import time
 import numpy as np
 from vllm import LLM, SamplingParams
 from datasets import load_from_disk
 
+@ray.remote(num_gpus=1, num_cpus=1)
 class vLLM_Expert:
     def __init__(self, id, model_name, k1, k2, L=0.03):
         self.id = id # id in dataset
@@ -11,6 +13,9 @@ class vLLM_Expert:
         self.k1 = k1
         self.k2 = k2
         self.L = L
+
+        gpu_ids = ray.get_gpu_ids()
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(int(gpu_id)) for gpu_id in gpu_ids)
         self.expert = LLM(model_name,
                         tensor_parallel_size=1,
                         gpu_memory_utilization=0.9,
@@ -37,6 +42,8 @@ class vLLM_Expert:
         self.rid2start_time[rid] = self.current_time
         self.rid2idx[rid] = idx
 
+        return rid
+
     def step(self):
         if not self.expert.llm_engine.has_unfinished_requests():
             self.current_time += 0.01
@@ -56,7 +63,14 @@ class vLLM_Expert:
 
                 latency = (self.current_time - self.rid2start_time[rid]) / len(i.outputs[0].token_ids)
                 self.reward += score if latency < self.L else 0.0
+        return self.current_time
     
+    def step_to_time(self, time, end=False):
+        while self.current_time < time if not end else self.expert.llm_engine.has_unfinished_requests():
+            self.step()
+        
+        return self.current_time
+
     def get_features(self):
         total = self.expert.llm_engine.cache_config.num_gpu_blocks
         used = 0
@@ -106,6 +120,9 @@ class vLLM_Expert:
         features.extend(running_request_feature)
         features.extend(waiting_request_feature)
         return features
+    
+    def get_length(self, prompt):
+        return len(self.expert.get_tokenizer()(prompt)["input_ids"])
 
     def get_and_reset_reward(self):
         reward = self.reward
